@@ -1,11 +1,11 @@
 // stream_bw.cpp
-// Measures sequential read bandwidth (GB/s) over a 2GB 1GB-hugepage region.
+// Measures sequential read bandwidth (GB/s) over a 1GB-hugepage region.
 // Each thread scans its own contiguous sub-region sequentially (cache-line stride),
 // wrapping around until iters_per_thread accesses are done.
 // Companion to randread_bw.cpp — same harness, sequential vs random access pattern.
 //
-// Usage: ./stream_bw [ncores] [iters_per_thread]
-//        e.g.: ./stream_bw 16 100000000   (default: ncores=16, iters=100000000)
+// Usage: ./stream_bw [ncores] [iters_per_thread] [hugepages_1gb]
+//        e.g.: ./stream_bw 16 100000000 2   (default: ncores=16, iters=100000000, hugepages=2)
 
 #include <algorithm>
 #include <barrier>
@@ -18,7 +18,6 @@
 #include <cstdio>
 #include <immintrin.h>
 #include <sys/mman.h>
-#include <pthread.h>
 
 #ifndef MAP_HUGE_SHIFT
 #define MAP_HUGE_SHIFT 26
@@ -27,9 +26,7 @@
 #define MAP_HUGE_1GB (30 << MAP_HUGE_SHIFT)
 #endif
 
-static constexpr uint64_t GB    = 1ULL << 30;
-static constexpr uint64_t TOTAL = 2ULL * GB;   // 2GB = 2 x 1GB hugepages
-static constexpr uint64_t NCL   = TOTAL / 64;  // number of 64B cache lines
+static constexpr uint64_t GB = 1ULL << 30;
 
 // Thread 0 stores the measurement start time immediately after the barrier.
 static std::atomic<std::chrono::steady_clock::time_point> g_t_start;
@@ -39,20 +36,17 @@ struct ThreadArg {
     int      ncores;
     uint8_t *base;
     int64_t  iters_per_thread;
+    uint64_t ncl;        // total number of 64B cachelines in region
     uint64_t sink_out;
 };
 
 static void thread_func(ThreadArg &a, std::barrier<> &bar) {
-    // Pin to CPU = tid (CPU 0..15 = distinct physical cores on 7950X)
-    cpu_set_t cs;
-    CPU_ZERO(&cs);
-    CPU_SET(a.tid, &cs);
-    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+    // CPU affinity is set externally by numactl -C / -m before process launch.
 
     // Divide the region into contiguous per-thread sub-ranges [cl_begin, cl_end).
-    uint64_t cl_per_thread = NCL / static_cast<uint64_t>(a.ncores);
+    uint64_t cl_per_thread = a.ncl / static_cast<uint64_t>(a.ncores);
     uint64_t cl_begin      = static_cast<uint64_t>(a.tid) * cl_per_thread;
-    uint64_t cl_end        = (a.tid == a.ncores - 1) ? NCL : cl_begin + cl_per_thread;
+    uint64_t cl_end        = (a.tid == a.ncores - 1) ? a.ncl : cl_begin + cl_per_thread;
 
     // Wait until all threads are ready, then start simultaneously.
     bar.arrive_and_wait();
@@ -90,6 +84,7 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
 int main(int argc, char *argv[]) {
     int     ncores           = (argc > 1) ? std::atoi(argv[1]) : 16;
     int64_t iters_per_thread = (argc > 2) ? std::atoll(argv[2]) : 100'000'000LL;
+    int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 2;
 
     if (ncores < 1 || ncores > 32) {
         std::fprintf(stderr, "error: ncores must be in [1, 32]\n");
@@ -99,36 +94,43 @@ int main(int argc, char *argv[]) {
         std::fprintf(stderr,
             "warning: ncores=%d > 16 physical cores — SMT siblings will be used\n",
             ncores);
+    if (hugepages_1gb < 1) {
+        std::fprintf(stderr, "error: hugepages_1gb must be >= 1\n");
+        return 1;
+    }
 
-    std::printf("ncores=%d  iters/thread=%lld  region=%llu GB  pattern=sequential\n",
-        ncores, (long long)iters_per_thread,
-        (unsigned long long)(TOTAL / GB));
+    uint64_t total = static_cast<uint64_t>(hugepages_1gb) * GB;
+    uint64_t ncl   = total / 64;   // number of 64B cachelines
 
-    // Allocate 2GB using two contiguous 1GB hugepages.
-    void *base_ptr = mmap(nullptr, TOTAL,
+    std::printf("ncores=%d  iters/thread=%lld  region=%d GB  pattern=sequential\n",
+        ncores, (long long)iters_per_thread, hugepages_1gb);
+
+    // Allocate hugepages_1gb × 1GB hugepages.
+    void *base_ptr = mmap(nullptr, total,
                           PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB,
                           -1, 0);
     if (base_ptr == MAP_FAILED) {
         std::perror("mmap 1GB hugepages failed");
         std::fprintf(stderr,
-            "hint: check 'grep HugePages /proc/meminfo'  (need HugePages_Free >= 2)\n");
+            "hint: check 'grep HugePages /proc/meminfo'  (need HugePages_Free >= %d)\n",
+            hugepages_1gb);
         return 1;
     }
 
     // Warm up: position-dependent fill commits physical pages and gives a
     // meaningful checksum (uniform memset would always yield checksum=0).
-    std::printf("Warming up 2 GB ... ");
+    std::printf("Warming up %d GB ... ", hugepages_1gb);
     std::fflush(stdout);
     uint64_t *p = static_cast<uint64_t *>(base_ptr);
-    for (uint64_t k = 0; k < TOTAL / 8; k++)
+    for (uint64_t k = 0; k < total / 8; k++)
         p[k] = k * 0x9E3779B97F4A7C15ULL;
     std::printf("done\n");
 
     // Per-thread arguments.
     std::vector<ThreadArg> args(ncores);
     for (int i = 0; i < ncores; i++)
-        args[i] = { i, ncores, static_cast<uint8_t *>(base_ptr), iters_per_thread, 0 };
+        args[i] = { i, ncores, static_cast<uint8_t *>(base_ptr), iters_per_thread, ncl, 0 };
 
     std::barrier<> bar(ncores);
 
@@ -161,6 +163,6 @@ int main(int argc, char *argv[]) {
     std::printf("GUPS           : %.4f\n", gups);
     std::printf("Checksum       : %016llx\n", (unsigned long long)total_sink);
 
-    munmap(base_ptr, TOTAL);
+    munmap(base_ptr, total);
     return 0;
 }

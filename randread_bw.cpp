@@ -1,10 +1,11 @@
 // randread_bw.cpp
-// Measures random-access read bandwidth (GB/s) over a 2GB 1GB-hugepage region.
+// Measures random-access read bandwidth (GB/s) over a 1GB-hugepage region.
 // Uses HPCC RandomAccess POLY LFSR addressing with UNROLL independent streams
 // per thread to maximise MLP (multiple outstanding cacheline loads).
 //
-// Usage: ./randread_bw [ncores] [iters_per_thread]
-//        e.g.: ./randread_bw 16 100000000   (default: ncores=16, iters=100000000)
+// Usage: ./randread_bw [ncores] [iters_per_thread] [hugepages_1gb]
+//        e.g.: ./randread_bw 16 100000000 2   (default: ncores=16, iters=100000000, hugepages=2)
+// Note: hugepages_1gb must be a power of 2 (LFSR mask addressing requirement).
 
 #include <barrier>
 #include <thread>
@@ -17,7 +18,6 @@
 #include <cstdio>
 #include <immintrin.h>
 #include <sys/mman.h>
-#include <pthread.h>
 
 #ifndef MAP_HUGE_SHIFT
 #define MAP_HUGE_SHIFT 26
@@ -30,10 +30,7 @@
 static constexpr uint64_t POLY   = 0x0000000000000007ULL;
 static constexpr int64_t  PERIOD = 1317624576693539401LL;
 
-static constexpr uint64_t GB    = 1ULL << 30;
-static constexpr uint64_t TOTAL = 2ULL * GB;     // 2GB = 2 x 1GB hugepages
-static constexpr uint64_t NCL   = TOTAL / 64;    // 2^25 cachelines
-static constexpr uint64_t MASK  = NCL - 1;
+static constexpr uint64_t GB = 1ULL << 30;
 
 static constexpr int UNROLL = 16;                 // independent RNG streams per thread
 
@@ -77,15 +74,12 @@ struct ThreadArg {
     int      tid;
     uint8_t *base;
     int64_t  L;          // iterations per stream  (= iters_per_thread / UNROLL)
+    uint64_t mask;       // cacheline index mask (= ncl - 1)
     uint64_t sink_out;   // accumulated read data; returned to main to prevent DCE
 };
 
 static void thread_func(ThreadArg &a, std::barrier<> &bar) {
-    // Pin to CPU = tid (CPU 0..15 = distinct physical cores on 7950X)
-    cpu_set_t cs;
-    CPU_ZERO(&cs);
-    CPU_SET(a.tid, &cs);
-    pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+    // CPU affinity is set externally by numactl -C / -m before process launch.
 
     // Initialise UNROLL independent LFSR streams via skip-ahead.
     // Global stream g = tid*UNROLL + u; each advances L steps → start at g*L.
@@ -102,8 +96,9 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
 
     // --- Measurement loop ---
     __m512i sink = _mm512_setzero_si512();
-    const uint8_t *base = a.base;
-    const int64_t  L    = a.L;
+    const uint8_t  *base = a.base;
+    const int64_t   L    = a.L;
+    const uint64_t  mask = a.mask;
 
     for (int64_t n = 0; n < L; n++) {
         for (int u = 0; u < UNROLL; u++) {
@@ -112,7 +107,7 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
             uint64_t mv = static_cast<uint64_t>(0) - (ran[u] >> 63);
             ran[u] = (ran[u] << 1) ^ (mv & POLY);
 
-            size_t idx = ran[u] & MASK;    // cacheline index in [0, NCL)
+            size_t idx = ran[u] & mask;    // cacheline index in [0, ncl)
             __m512i v = _mm512_load_si512(
                 reinterpret_cast<const __m512i *>(base + idx * 64));
             sink = _mm512_xor_si512(sink, v);  // accumulate to prevent DCE
@@ -130,6 +125,7 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
 int main(int argc, char *argv[]) {
     int     ncores           = (argc > 1) ? std::atoi(argv[1]) : 16;
     int64_t iters_per_thread = (argc > 2) ? std::atoll(argv[2]) : 100'000'000LL;
+    int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 2;
 
     if (ncores < 1 || ncores > 32) {
         std::fprintf(stderr, "error: ncores must be in [1, 32]\n");
@@ -139,36 +135,53 @@ int main(int argc, char *argv[]) {
         std::fprintf(stderr,
             "warning: ncores=%d > 16 physical cores — SMT siblings will be used\n",
             ncores);
+    if (hugepages_1gb < 1) {
+        std::fprintf(stderr, "error: hugepages_1gb must be >= 1\n");
+        return 1;
+    }
+    // LFSR mask addressing requires NCL (= hugepages_1gb * GB / 64) to be a power of 2,
+    // which holds iff hugepages_1gb is a power of 2.
+    if ((hugepages_1gb & (hugepages_1gb - 1)) != 0) {
+        std::fprintf(stderr,
+            "error: hugepages_1gb=%d must be a power of 2 (1,2,4,8,...) for LFSR mask addressing\n",
+            hugepages_1gb);
+        return 1;
+    }
+
+    uint64_t total = static_cast<uint64_t>(hugepages_1gb) * GB;
+    uint64_t ncl   = total / 64;   // number of cachelines
+    uint64_t mask  = ncl - 1;
 
     iters_per_thread = (iters_per_thread / UNROLL) * UNROLL;  // round to UNROLL multiple
     int64_t L = iters_per_thread / UNROLL;
 
-    std::printf("ncores=%d  iters/thread=%lld  streams=%d  region=%llu GB\n",
+    std::printf("ncores=%d  iters/thread=%lld  streams=%d  region=%d GB\n",
         ncores, (long long)iters_per_thread,
-        ncores * UNROLL, (unsigned long long)(TOTAL / GB));
+        ncores * UNROLL, hugepages_1gb);
 
-    // Allocate 2GB using two contiguous 1GB hugepages
-    void *base_ptr = mmap(nullptr, TOTAL,
+    // Allocate hugepages_1gb × 1GB hugepages
+    void *base_ptr = mmap(nullptr, total,
                           PROT_READ | PROT_WRITE,
                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB,
                           -1, 0);
     if (base_ptr == MAP_FAILED) {
         std::perror("mmap 1GB hugepages failed");
         std::fprintf(stderr,
-            "hint: check 'grep HugePages /proc/meminfo'  (need HugePages_Free >= 2)\n");
+            "hint: check 'grep HugePages /proc/meminfo'  (need HugePages_Free >= %d)\n",
+            hugepages_1gb);
         return 1;
     }
 
     // Warm up: sequential write to commit physical pages before read-only measurement
-    std::printf("Warming up 2 GB ... ");
+    std::printf("Warming up %d GB ... ", hugepages_1gb);
     std::fflush(stdout);
-    std::memset(base_ptr, 0x5A, TOTAL);
+    std::memset(base_ptr, 0x5A, total);
     std::printf("done\n");
 
     // Per-thread arguments
     std::vector<ThreadArg> args(ncores);
     for (int i = 0; i < ncores; i++)
-        args[i] = { i, static_cast<uint8_t *>(base_ptr), L, 0 };
+        args[i] = { i, static_cast<uint8_t *>(base_ptr), L, mask, 0 };
 
     std::barrier<> bar(ncores);
 
@@ -201,6 +214,6 @@ int main(int argc, char *argv[]) {
     std::printf("GUPS           : %.4f\n", gups);
     std::printf("Checksum       : %016llx\n", (unsigned long long)total_sink);
 
-    munmap(base_ptr, TOTAL);
+    munmap(base_ptr, total);
     return 0;
 }

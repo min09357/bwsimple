@@ -8,6 +8,8 @@ Usage:
   python3 sweep_bw.py          # random access (default)
   python3 sweep_bw.py rand     # random access
   python3 sweep_bw.py stream   # sequential access
+
+Edit config.py to change hardware/sweep settings.
 """
 
 import re
@@ -15,22 +17,7 @@ import subprocess
 import sys
 import os
 
-# ─── DIMM configuration ───────────────────────────────────────────────────────
-# Check with: sudo dmidecode -t memory | grep -E "Speed|Configured"
-
-DIMM_TRANSFER_RATE_MT_S = 5200   # e.g. DDR5-4800 → 4800, DDR4-3200 → 3200
-DIMM_CHANNELS           = 1      # number of populated memory channels
-
-# ─── Sweep configuration ─────────────────────────────────────────────────────
-
-CORE_START = 1     # first core count to test
-CORE_MAX   = 16    # last  core count to test  (None → detect logical CPUs)
-CORE_STEP  = 1     # increment between steps
-
-ITERS_PER_THREAD = 100_000_000   # passed as 2nd arg to the binary
-
-# Set to True if the binary needs sudo to allocate 1GB hugepages
-USE_SUDO = False
+import config as cfg
 
 # Paths to binaries (resolved relative to this script)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -39,7 +26,24 @@ BINARY_STREAM = os.path.join(_SCRIPT_DIR, "stream_bw")
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-PHYSICAL_CORES = 16   # SMT warning threshold
+
+def numa_node_cpus(node: int) -> list[int]:
+    """Return sorted CPU list for the given NUMA node via sysfs.
+    Falls back to all logical CPUs if sysfs is unavailable."""
+    path = f"/sys/devices/system/node/node{node}/cpulist"
+    try:
+        text = open(path).read().strip()
+    except OSError:
+        return list(range(os.cpu_count() or 1))
+    cpus: list[int] = []
+    for token in text.split(","):
+        token = token.strip()
+        if "-" in token:
+            a, b = token.split("-", 1)
+            cpus.extend(range(int(a), int(b) + 1))
+        else:
+            cpus.append(int(token))
+    return sorted(cpus)
 
 
 def resolve_mode(argv: list[str]) -> tuple[str, str]:
@@ -54,7 +58,7 @@ def resolve_mode(argv: list[str]) -> tuple[str, str]:
 
 def theoretical_peak_gb_s() -> float:
     """Peak BW = rate (MT/s) × 8 B/transfer × channels / 1000"""
-    return DIMM_TRANSFER_RATE_MT_S * 8 * DIMM_CHANNELS / 1000.0
+    return cfg.DIMM_TRANSFER_RATE_MT_S * 8 * cfg.DIMM_CHANNELS / 1000.0
 
 
 def parse_bandwidth(output: str) -> tuple[float, float]:
@@ -66,16 +70,22 @@ def parse_bandwidth(output: str) -> tuple[float, float]:
     return float(m_elapsed.group(1)), float(m_bw.group(1))
 
 
-def run_benchmark(ncores: int, binary: str) -> tuple[float, float]:
-    """Run the benchmark binary and return (elapsed_s, bw_gb_s)."""
+def run_benchmark(cpus: list[int], binary: str) -> tuple[float, float]:
+    """Run the benchmark binary under numactl and return (elapsed_s, bw_gb_s)."""
+    cpulist = ",".join(map(str, cpus))
     cmd = []
-    if USE_SUDO:
+    if cfg.USE_SUDO:
         cmd.append("sudo")
-    cmd += [binary, str(ncores), str(ITERS_PER_THREAD)]
+    cmd += [
+        "numactl",
+        "-C", cpulist,
+        "-m", str(cfg.NUMA_NODE),
+        binary, str(len(cpus)), str(cfg.ITERS_PER_THREAD), str(cfg.HUGEPAGES_1GB),
+    ]
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"\n[ERROR] core={ncores} failed (rc={result.returncode})", file=sys.stderr)
+        print(f"\n[ERROR] core={len(cpus)} failed (rc={result.returncode})", file=sys.stderr)
         print(result.stderr, file=sys.stderr)
         return None, None
     return parse_bandwidth(result.stdout)
@@ -92,22 +102,35 @@ def main() -> None:
     if not os.path.isfile(binary):
         sys.exit(f"Binary not found: {binary}\nRun 'make' first.")
 
-    max_cores = CORE_MAX if CORE_MAX is not None else os.cpu_count()
+    # randread uses LFSR mask addressing — hugepage count must be a power of 2
+    if mode == "rand":
+        hp = cfg.HUGEPAGES_1GB
+        if hp < 1 or (hp & (hp - 1)) != 0:
+            sys.exit(
+                f"config.HUGEPAGES_1GB={hp} must be a power of 2 (1,2,4,8,...) "
+                "for rand mode (LFSR mask addressing)."
+            )
+
+    node_cpus = numa_node_cpus(cfg.NUMA_NODE)
+    max_cores = min(cfg.CORE_MAX if cfg.CORE_MAX is not None else len(node_cpus), len(node_cpus))
     peak      = theoretical_peak_gb_s()
     bus_width = 8  # bytes per transfer (DDR standard)
 
-    core_list = list(range(CORE_START, max_cores + 1, CORE_STEP))
+    core_list = list(range(cfg.CORE_START, max_cores + 1, cfg.CORE_STEP))
     if core_list[-1] != max_cores:
         core_list.append(max_cores)
 
+    cpu_preview = ",".join(map(str, node_cpus[:4])) + (",..." if len(node_cpus) > 4 else "")
     mode_label = "random access" if mode == "rand" else "sequential access"
     print("=" * 65)
     print(f" {os.path.basename(binary)} — core sweep  [{mode_label}]")
     print("=" * 65)
-    print(f"  DIMM rate   : {DIMM_TRANSFER_RATE_MT_S} MT/s × {bus_width} B × "
-          f"{DIMM_CHANNELS} ch  →  peak {peak:.1f} GB/s")
-    print(f"  Core range  : {CORE_START} .. {max_cores}  (step {CORE_STEP})")
-    print(f"  Iters/thread: {ITERS_PER_THREAD:,}")
+    print(f"  DIMM rate   : {cfg.DIMM_TRANSFER_RATE_MT_S} MT/s × {bus_width} B × "
+          f"{cfg.DIMM_CHANNELS} ch  →  peak {peak:.1f} GB/s")
+    print(f"  NUMA node   : {cfg.NUMA_NODE}  (CPUs: {cpu_preview})")
+    print(f"  Core range  : {cfg.CORE_START} .. {max_cores}  (step {cfg.CORE_STEP})")
+    print(f"  Iters/thread: {cfg.ITERS_PER_THREAD:,}")
+    print(f"  Hugepages   : {cfg.HUGEPAGES_1GB} × 1GB  ({cfg.HUGEPAGES_1GB} GB region)")
     print(f"  Binary      : {binary}")
     print("=" * 65)
     print()
@@ -119,10 +142,10 @@ def main() -> None:
     results: list[tuple[int, float, float]] = []
 
     for ncores in core_list:
-        smt_tag = " [SMT]" if ncores > PHYSICAL_CORES else ""
-        print(f"  Running {ncores:>2} core(s){smt_tag} ... ", end="", flush=True)
+        cpus = node_cpus[:ncores]
+        print(f"  Running {ncores:>2} core(s) ... ", end="", flush=True)
 
-        elapsed, bw = run_benchmark(ncores, binary)
+        elapsed, bw = run_benchmark(cpus, binary)
         if bw is None:
             print("FAILED")
             continue
