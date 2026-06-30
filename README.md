@@ -9,7 +9,8 @@
 | `randread_bw` | 무작위 read | HPCC RandomAccess POLY LFSR 주소 생성, 캐시라인 단위 random read |
 | `stream_bw` | 순차 read | 스레드별 연속 구간을 캐시라인 stride로 순차 스캔 (STREAM 류) |
 | `sweep_bw.py` | — | 1코어부터 N코어까지 스윕하며 대역폭·이론 DRAM 피크 대비 % 출력 |
-| `config.py` | — | DIMM·NUMA·hugepage·스윕 범위 등 모든 설정을 관리하는 설정 파일 |
+| `config.py` | — | DIMM·NUMA·hugepage·스윕 범위 등 모든 설정을 관리하는 설정 파일 (git 미추적, `make` 시 자동 생성) |
+| `config_template.py` | — | `config.py`의 기본값 템플릿 (git 추적) |
 
 ## 설계 요점
 
@@ -40,7 +41,7 @@
 ## 빌드
 
 ```bash
-make            # randread_bw, stream_bw 둘 다 빌드 (SIMD 폭 자동 감지)
+make            # config.py 자동 생성(없을 때) 후 randread_bw, stream_bw 빌드 (SIMD 폭 자동 감지)
 make WIDTH=256  # AVX2 256비트로 강제
 make WIDTH=64   # 스칼라(64비트)로 강제
 make WIDTH=512 EXTRA_CXXFLAGS=-mavx512f  # AVX-512 강제 (해당 ISA 지원 머신/시뮬레이터용)
@@ -101,6 +102,7 @@ python3 sweep_bw.py stream   # 순차 접근
 ```
 
 `config.py`에서 모든 설정을 관리합니다. 스크립트를 실행하기 전에 이 파일을 편집하세요.
+`config.py`는 git에 추적되지 않는 로컬 파일로, `make` 실행 시 `config_template.py`로부터 자동 생성됩니다 (이미 존재하면 덮어쓰지 않음).
 
 | 항목 | 상수 | 의미 |
 |---|---|---|

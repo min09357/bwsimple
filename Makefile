@@ -26,7 +26,15 @@ TARGETS = randread_bw stream_bw
 
 .PHONY: all clean
 
-all: $(TARGETS)
+all: config.py $(TARGETS)
+
+config.py: config_template.py
+	@if [ ! -f config.py ]; then \
+		cp config_template.py config.py; \
+		echo ">> config.py created from config.example.py — review values before running."; \
+	else \
+		touch config.py; \
+	fi
 
 randread_bw: randread_bw.cpp bw_width.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
