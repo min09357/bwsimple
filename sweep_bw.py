@@ -84,7 +84,7 @@ def probe_simd_width(binary: str) -> str:
     return "unknown"
 
 
-def run_benchmark(cpus: list[int], binary: str) -> tuple[float, float]:
+def run_benchmark(cpus: list[int], binary: str, mode: str) -> tuple[float, float]:
     """Run the benchmark binary under numactl and return (elapsed_s, bw_gb_s)."""
     cpulist = ",".join(map(str, cpus))
     cmd = []
@@ -96,6 +96,8 @@ def run_benchmark(cpus: list[int], binary: str) -> tuple[float, float]:
         "-m", str(cfg.NUMA_NODE),
         binary, str(len(cpus)), str(cfg.ITERS_PER_THREAD), str(cfg.HUGEPAGES_1GB),
     ]
+    if mode == "rand":
+        cmd.append(str(cfg.LINES_PER_ACCESS))
 
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -124,6 +126,11 @@ def main() -> None:
                 f"config.HUGEPAGES_1GB={hp} must be a power of 2 (1,2,4,8,...) "
                 "for rand mode (LFSR mask addressing)."
             )
+        lpa = cfg.LINES_PER_ACCESS
+        if lpa not in (1, 2, 4, 8, 16):
+            sys.exit(
+                f"config.LINES_PER_ACCESS={lpa} must be one of {{1,2,4,8,16}}."
+            )
 
     node_cpus = numa_node_cpus(cfg.NUMA_NODE)
     max_cores = min(cfg.CORE_MAX if cfg.CORE_MAX is not None else len(node_cpus), len(node_cpus))
@@ -146,6 +153,8 @@ def main() -> None:
     print(f"  Core range  : {cfg.CORE_START} .. {max_cores}  (step {cfg.CORE_STEP})")
     print(f"  Iters/thread: {cfg.ITERS_PER_THREAD:,}")
     print(f"  Hugepages   : {cfg.HUGEPAGES_1GB} × 1GB  ({cfg.HUGEPAGES_1GB} GB region)")
+    if mode == "rand":
+        print(f"  Lines/access: {cfg.LINES_PER_ACCESS}  ({cfg.LINES_PER_ACCESS * 64} B/access)")
     print(f"  Binary      : {binary}")
     print(f"  SIMD width  : {simd_width}")
     print("=" * 65)
@@ -161,7 +170,7 @@ def main() -> None:
         cpus = node_cpus[:ncores]
         print(f"  Running {ncores:>2} core(s) ... ", end="", flush=True)
 
-        elapsed, bw = run_benchmark(cpus, binary)
+        elapsed, bw = run_benchmark(cpus, binary, mode)
         if bw is None:
             print("FAILED")
             continue

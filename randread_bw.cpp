@@ -3,9 +3,13 @@
 // Uses HPCC RandomAccess POLY LFSR addressing with UNROLL independent streams
 // per thread to maximise MLP (multiple outstanding cacheline loads).
 //
-// Usage: ./randread_bw [ncores] [iters_per_thread] [hugepages_1gb]
-//        e.g.: ./randread_bw 16 100000000 2   (default: ncores=16, iters=100000000, hugepages=2)
+// Usage: ./randread_bw [ncores] [iters_per_thread] [hugepages_1gb] [lines_per_access]
+//        e.g.: ./randread_bw 16 100000000 4 4   (default: ncores=16, iters=100000000, hugepages=4, lines=1)
 // Note: hugepages_1gb must be a power of 2 (LFSR mask addressing requirement).
+//       lines_per_access ∈ {1,2,4,8,16}; each random access fetches that many consecutive
+//       cachelines starting at a block-aligned address (aligned to lines_per_access*64B).
+//       iters_per_thread counts total 64B cachelines fetched per thread;
+//       address-generation count = iters_per_thread / lines_per_access.
 
 #include <barrier>
 #include <thread>
@@ -74,11 +78,14 @@ static std::atomic<std::chrono::steady_clock::time_point> g_t_start;
 struct ThreadArg {
     int      tid;
     uint8_t *base;
-    int64_t  L;          // iterations per stream  (= iters_per_thread / UNROLL)
-    uint64_t mask;       // cacheline index mask (= ncl - 1)
+    int64_t  L;          // address-generation iterations per stream (= iters_per_thread / UNROLL / LINES)
+    uint64_t mask;       // block index mask (= nblk - 1, where nblk = ncl / LINES)
     uint64_t sink_out;   // accumulated read data; returned to main to prevent DCE
 };
 
+// LINES is a compile-time constant; the inner k-loop is fully unrolled by -O3,
+// leaving no loop-branch overhead in the hot path.
+template <int LINES>
 static void thread_func(ThreadArg &a, std::barrier<> &bar) {
     // CPU affinity is set externally by numactl -C / -m before process launch.
 
@@ -115,20 +122,23 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
             uint64_t mv = static_cast<uint64_t>(0) - (ran[u] >> 63);
             ran[u] = (ran[u] << 1) ^ (mv & POLY);
 
-            size_t idx = ran[u] & mask;    // cacheline index in [0, ncl)
+            size_t blk = ran[u] & mask;    // block index in [0, nblk)
+            const uint8_t *p = base + blk * (static_cast<size_t>(LINES) * 64);
+            for (int k = 0; k < LINES; k++) {
 #if BW_SIMD_WIDTH == 512
-            __m512i v = _mm512_load_si512(
-                reinterpret_cast<const __m512i *>(base + idx * 64));
-            sink = _mm512_xor_si512(sink, v);  // accumulate to prevent DCE
+                __m512i v = _mm512_load_si512(
+                    reinterpret_cast<const __m512i *>(p + k * 64));
+                sink = _mm512_xor_si512(sink, v);
 #elif BW_SIMD_WIDTH == 256
-            __m256i v = _mm256_load_si256(
-                reinterpret_cast<const __m256i *>(base + idx * 64));
-            sink = _mm256_xor_si256(sink, v);  // accumulate to prevent DCE
+                __m256i v = _mm256_load_si256(
+                    reinterpret_cast<const __m256i *>(p + k * 64));
+                sink = _mm256_xor_si256(sink, v);
 #else
-            uint64_t v;
-            std::memcpy(&v, base + idx * 64, sizeof(v));
-            sink ^= v;                         // accumulate to prevent DCE
+                uint64_t v;
+                std::memcpy(&v, p + k * 64, sizeof(v));
+                sink ^= v;
 #endif
+            }
         }
     }
 
@@ -150,6 +160,15 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
 #endif
 }
 
+template <int LINES>
+static void run_measurement(std::vector<ThreadArg> &args, std::barrier<> &bar, int ncores) {
+    std::vector<std::jthread> threads;
+    threads.reserve(ncores);
+    for (int i = 0; i < ncores; i++)
+        threads.emplace_back([&args, &bar, i] { thread_func<LINES>(args[i], bar); });
+    threads.clear();  // jthread destructor joins each thread
+}
+
 int main(int argc, char *argv[]) {
     // Probe mode: print the compiled SIMD width and exit (used by sweep_bw.py).
     if (argc > 1 && std::strcmp(argv[1], "--simd") == 0) {
@@ -159,7 +178,8 @@ int main(int argc, char *argv[]) {
 
     int     ncores           = (argc > 1) ? std::atoi(argv[1]) : 16;
     int64_t iters_per_thread = (argc > 2) ? std::atoll(argv[2]) : 100'000'000LL;
-    int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 2;
+    int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 4;
+    int     lines_per_access = (argc > 4) ? std::atoi(argv[4]) : 1;
 
     if (ncores < 1) {
         std::fprintf(stderr, "error: ncores must be >= 1\n");
@@ -177,17 +197,27 @@ int main(int argc, char *argv[]) {
             hugepages_1gb);
         return 1;
     }
+    if (lines_per_access != 1 && lines_per_access != 2 && lines_per_access != 4 &&
+        lines_per_access != 8 && lines_per_access != 16) {
+        std::fprintf(stderr,
+            "error: lines_per_access=%d must be one of {1,2,4,8,16}\n",
+            lines_per_access);
+        return 1;
+    }
 
     uint64_t total = static_cast<uint64_t>(hugepages_1gb) * GB;
-    uint64_t ncl   = total / 64;   // number of cachelines
-    uint64_t mask  = ncl - 1;
+    uint64_t ncl   = total / 64;    // number of cachelines
+    uint64_t nblk  = ncl / static_cast<uint64_t>(lines_per_access);  // aligned blocks
+    uint64_t mask  = nblk - 1;
 
-    iters_per_thread = (iters_per_thread / UNROLL) * UNROLL;  // round to UNROLL multiple
-    int64_t L = iters_per_thread / UNROLL;
+    // Round to UNROLL * lines_per_access so each stream does L complete block accesses.
+    int64_t round = static_cast<int64_t>(UNROLL) * lines_per_access;
+    iters_per_thread = (iters_per_thread / round) * round;
+    int64_t L = iters_per_thread / UNROLL / lines_per_access;  // address-gen iters per stream
 
-    std::printf("ncores=%d  iters/thread=%lld  streams=%d  region=%d GB  simd=%s\n",
+    std::printf("ncores=%d  iters/thread=%lld  streams=%d  region=%d GB  lines/access=%d (%d B)  simd=%s\n",
         ncores, (long long)iters_per_thread,
-        ncores * UNROLL, hugepages_1gb, BW_SIMD_WIDTH_STR);
+        ncores * UNROLL, hugepages_1gb, lines_per_access, lines_per_access * 64, BW_SIMD_WIDTH_STR);
 
     // Allocate hugepages_1gb × 1GB hugepages
     void *base_ptr = mmap(nullptr, total,
@@ -215,13 +245,13 @@ int main(int argc, char *argv[]) {
 
     std::barrier<> bar(ncores);
 
-    // Launch threads
-    std::vector<std::jthread> threads;
-    threads.reserve(ncores);
-    for (int i = 0; i < ncores; i++)
-        threads.emplace_back([&args, &bar, i] { thread_func(args[i], bar); });
-
-    threads.clear();  // jthread destructor joins each thread
+    switch (lines_per_access) {
+        case  1: run_measurement< 1>(args, bar, ncores); break;
+        case  2: run_measurement< 2>(args, bar, ncores); break;
+        case  4: run_measurement< 4>(args, bar, ncores); break;
+        case  8: run_measurement< 8>(args, bar, ncores); break;
+        case 16: run_measurement<16>(args, bar, ncores); break;
+    }
 
     auto t_end   = std::chrono::steady_clock::now();
     auto t_start = g_t_start.load(std::memory_order_acquire);
@@ -231,8 +261,10 @@ int main(int argc, char *argv[]) {
     uint64_t total_sink = 0;
     for (int i = 0; i < ncores; i++) total_sink ^= args[i].sink_out;
 
+    // total_bytes: N-independent — iters counts cachelines, not accesses
     double total_bytes = static_cast<double>(ncores) * iters_per_thread * 64.0;
-    double total_iters = static_cast<double>(ncores) * iters_per_thread;
+    // total_iters: address-generation count (each access → lines_per_access cachelines)
+    double total_iters = static_cast<double>(ncores) * iters_per_thread / lines_per_access;
     double bw_GBs  = total_bytes / elapsed / 1e9;
     double bw_GiBs = total_bytes / elapsed / static_cast<double>(1ULL << 30);
     double gups    = total_iters / elapsed / 1e9;

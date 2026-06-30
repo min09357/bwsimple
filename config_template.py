@@ -31,6 +31,12 @@ CORE_STEP  = 1     # increment between steps
 
 ITERS_PER_THREAD = 100_000_000   # passed as 2nd arg to the binary
 
+# Number of consecutive cachelines to fetch per random access (rand mode only).
+# Start address is aligned to lines_per_access*64B so accesses never straddle block boundaries.
+# Allowed values: 1, 2, 4, 8, 16  (default 1 = single cacheline, classic random-read behaviour)
+# iters_per_thread counts total 64B cachelines, so total traffic is N-independent.
+LINES_PER_ACCESS = 1
+
 # ─── Misc ────────────────────────────────────────────────────────────────────
 
 # Set to True if the binary needs sudo to allocate 1GB hugepages
