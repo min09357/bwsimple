@@ -161,14 +161,10 @@ int main(int argc, char *argv[]) {
     int64_t iters_per_thread = (argc > 2) ? std::atoll(argv[2]) : 100'000'000LL;
     int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 2;
 
-    if (ncores < 1 || ncores > 32) {
-        std::fprintf(stderr, "error: ncores must be in [1, 32]\n");
+    if (ncores < 1) {
+        std::fprintf(stderr, "error: ncores must be >= 1\n");
         return 1;
     }
-    if (ncores > 16)
-        std::fprintf(stderr,
-            "warning: ncores=%d > 16 physical cores — SMT siblings will be used\n",
-            ncores);
     if (hugepages_1gb < 1) {
         std::fprintf(stderr, "error: hugepages_1gb must be >= 1\n");
         return 1;
