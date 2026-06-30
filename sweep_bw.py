@@ -70,6 +70,20 @@ def parse_bandwidth(output: str) -> tuple[float, float]:
     return float(m_elapsed.group(1)), float(m_bw.group(1))
 
 
+def probe_simd_width(binary: str) -> str:
+    """Ask the binary which SIMD width it was compiled with (--simd: no measurement run)."""
+    try:
+        result = subprocess.run(
+            [binary, "--simd"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
 def run_benchmark(cpus: list[int], binary: str) -> tuple[float, float]:
     """Run the benchmark binary under numactl and return (elapsed_s, bw_gb_s)."""
     cpulist = ",".join(map(str, cpus))
@@ -120,6 +134,7 @@ def main() -> None:
     if core_list[-1] != max_cores:
         core_list.append(max_cores)
 
+    simd_width = probe_simd_width(binary)
     cpu_preview = ",".join(map(str, node_cpus[:4])) + (",..." if len(node_cpus) > 4 else "")
     mode_label = "random access" if mode == "rand" else "sequential access"
     print("=" * 65)
@@ -132,6 +147,7 @@ def main() -> None:
     print(f"  Iters/thread: {cfg.ITERS_PER_THREAD:,}")
     print(f"  Hugepages   : {cfg.HUGEPAGES_1GB} × 1GB  ({cfg.HUGEPAGES_1GB} GB region)")
     print(f"  Binary      : {binary}")
+    print(f"  SIMD width  : {simd_width}")
     print("=" * 65)
     print()
 

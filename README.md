@@ -16,11 +16,12 @@
 | 항목 | 결정 |
 |---|---|
 | 메모리 영역 | `HUGEPAGES_1GB` × 1GB (`MAP_HUGE_1GB`), 연속 가상 주소 (기본 2GB) |
-| 접근 단위 | 64B (AVX-512 aligned load = 1 캐시라인) |
+| 접근 단위 | 64B (캐시라인 = 1 DRAM 트랜잭션; SIMD 로드 폭은 컴파일 타임 선택) |
 | 연산 종류 | Read 전용 |
 | 병렬화 | `std::jthread` + `std::barrier`, 코어당 1스레드 |
 | 코어 핀 | `numactl -C <cpulist> -m <node>` 로 외부에서 설정 (`sweep_bw.py` 가 자동 처리) |
-| DCE 방지 | 읽은 데이터를 `_mm512_xor` 누적 → checksum 출력 |
+| DCE 방지 | 읽은 데이터를 SIMD XOR 또는 스칼라 XOR로 누적 → checksum 출력 |
+| SIMD 폭 | 컴파일 타임 자동 감지 (AVX-512→512, AVX2→256, 없음→64비트 스칼라); `make WIDTH=N`으로 강제 지정 가능 |
 
 ### randread_bw 전용
 
@@ -39,10 +40,34 @@
 ## 빌드
 
 ```bash
-make            # randread_bw, stream_bw 둘 다 빌드
+make            # randread_bw, stream_bw 둘 다 빌드 (SIMD 폭 자동 감지)
+make WIDTH=256  # AVX2 256비트로 강제
+make WIDTH=64   # 스칼라(64비트)로 강제
+make WIDTH=512 EXTRA_CXXFLAGS=-mavx512f  # AVX-512 강제 (해당 ISA 지원 머신/시뮬레이터용)
 ```
 
-요구 환경: g++ 13+, AVX-512F, Linux(1GB hugepage 지원).
+요구 환경: g++ 13+, Linux(1GB hugepage 지원).
+
+## SIMD 로드 폭 (512 / 256 / 64)
+
+64B 캐시라인 1개 = DRAM 트랜잭션 1개입니다. 라인을 한 번만 건드리면(폭과 무관) 미스 시 64B 전체가 올라오고, 대역폭 계산은 `반복 횟수 × 64B`로 하므로 **로드 폭은 측정 정확성에 영향을 주지 않습니다.** 따라서 라인당 1 로드를 유지하면서 CPU가 지원하는 폭만 맞춰주면 됩니다.
+
+폭은 **컴파일 타임에 결정**됩니다 (런타임 `if` 분기가 아니라 `#if` 전처리기 분기 — 선택되지 않은 코드는 바이너리에 아예 생성되지 않음). 폭 결정 로직은 [bw_width.h](bw_width.h)에 모여 있습니다.
+
+| 빌드 명령 | 결과 폭 | 비고 |
+|---|---|---|
+| `make` | 자동 감지 | `-march=native` 기준: AVX-512→512, AVX2→256, 둘 다 없으면 64비트 스칼라 |
+| `make WIDTH=256` | 256 (AVX2) | 명시적 강제 |
+| `make WIDTH=64` | 64 (scalar) | SIMD ISA 불필요 (어느 CPU/시뮬레이터든 동작) |
+| `make WIDTH=512 EXTRA_CXXFLAGS=-mavx512f` | 512 (AVX-512) | native에 없는 폭 강제 시 arch 플래그 동반 필요 |
+
+> `WIDTH=`는 빌드 호스트가 아닌 **다른 머신·시뮬레이터에 바이너리를 연동**할 때 폭을 명시 고정하기 위한 옵션입니다. 미지정 시 빌드 호스트 ISA에 맞춰 자동 감지됩니다. native에 없는 폭을 `WIDTH=`로만 강제하면 컴파일 시 `#error`로 깔끔히 실패합니다.
+
+선택된 폭은 세 곳에서 확인할 수 있습니다:
+
+- **컴파일 시** — 빌드 로그: `note: '#pragma message: BW_SIMD_WIDTH = 256 (AVX2)'`
+- **실행 시** — 시작 줄: `... region=2 GB  simd=256 (AVX2)`
+- **조회 전용** — `./randread_bw --simd` / `./stream_bw --simd` → 폭 한 줄만 출력하고 즉시 종료 (측정/메모리 할당 없음; `sweep_bw.py`가 헤더 표시에 사용)
 
 ## 실행
 
@@ -93,7 +118,7 @@ python3 sweep_bw.py stream   # 순차 접근
 ## 출력 해석
 
 ```
-ncores=16  iters/thread=100000000  streams=256  region=2 GB
+ncores=16  iters/thread=100000000  streams=256  region=2 GB  simd=256 (AVX2)
 Warming up 2 GB ... done
 ```
 
@@ -109,6 +134,7 @@ Warming up 2 GB ... done
   Iters/thread: 100,000,000
   Hugepages   : 2 × 1GB  (2 GB region)
   Binary      : /path/to/randread_bw
+  SIMD width  : 256 (AVX2)
 =================================================================
 ```
 

@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <immintrin.h>
 #include <sys/mman.h>
+#include "bw_width.h"
 
 #ifndef MAP_HUGE_SHIFT
 #define MAP_HUGE_SHIFT 26
@@ -95,10 +96,17 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
                         std::memory_order_release);
 
     // --- Measurement loop ---
-    __m512i sink = _mm512_setzero_si512();
     const uint8_t  *base = a.base;
     const int64_t   L    = a.L;
     const uint64_t  mask = a.mask;
+
+#if BW_SIMD_WIDTH == 512
+    __m512i sink = _mm512_setzero_si512();
+#elif BW_SIMD_WIDTH == 256
+    __m256i sink = _mm256_setzero_si256();
+#else
+    uint64_t sink = 0;
+#endif
 
     for (int64_t n = 0; n < L; n++) {
         for (int u = 0; u < UNROLL; u++) {
@@ -108,21 +116,47 @@ static void thread_func(ThreadArg &a, std::barrier<> &bar) {
             ran[u] = (ran[u] << 1) ^ (mv & POLY);
 
             size_t idx = ran[u] & mask;    // cacheline index in [0, ncl)
+#if BW_SIMD_WIDTH == 512
             __m512i v = _mm512_load_si512(
                 reinterpret_cast<const __m512i *>(base + idx * 64));
             sink = _mm512_xor_si512(sink, v);  // accumulate to prevent DCE
+#elif BW_SIMD_WIDTH == 256
+            __m256i v = _mm256_load_si256(
+                reinterpret_cast<const __m256i *>(base + idx * 64));
+            sink = _mm256_xor_si256(sink, v);  // accumulate to prevent DCE
+#else
+            uint64_t v;
+            std::memcpy(&v, base + idx * 64, sizeof(v));
+            sink ^= v;                         // accumulate to prevent DCE
+#endif
         }
     }
 
-    // Reduce 512-bit sink to 64-bit for the caller
+    // Reduce sink to 64-bit for the caller
+#if BW_SIMD_WIDTH == 512
     alignas(64) uint64_t buf[8];
     _mm512_store_si512(reinterpret_cast<__m512i *>(buf), sink);
     uint64_t s = 0;
     for (int i = 0; i < 8; i++) s ^= buf[i];
     a.sink_out = s;
+#elif BW_SIMD_WIDTH == 256
+    alignas(32) uint64_t buf[4];
+    _mm256_store_si256(reinterpret_cast<__m256i *>(buf), sink);
+    uint64_t s = 0;
+    for (int i = 0; i < 4; i++) s ^= buf[i];
+    a.sink_out = s;
+#else
+    a.sink_out = sink;
+#endif
 }
 
 int main(int argc, char *argv[]) {
+    // Probe mode: print the compiled SIMD width and exit (used by sweep_bw.py).
+    if (argc > 1 && std::strcmp(argv[1], "--simd") == 0) {
+        std::printf("%s\n", BW_SIMD_WIDTH_STR);
+        return 0;
+    }
+
     int     ncores           = (argc > 1) ? std::atoi(argv[1]) : 16;
     int64_t iters_per_thread = (argc > 2) ? std::atoll(argv[2]) : 100'000'000LL;
     int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 2;
@@ -155,9 +189,9 @@ int main(int argc, char *argv[]) {
     iters_per_thread = (iters_per_thread / UNROLL) * UNROLL;  // round to UNROLL multiple
     int64_t L = iters_per_thread / UNROLL;
 
-    std::printf("ncores=%d  iters/thread=%lld  streams=%d  region=%d GB\n",
+    std::printf("ncores=%d  iters/thread=%lld  streams=%d  region=%d GB  simd=%s\n",
         ncores, (long long)iters_per_thread,
-        ncores * UNROLL, hugepages_1gb);
+        ncores * UNROLL, hugepages_1gb, BW_SIMD_WIDTH_STR);
 
     // Allocate hugepages_1gb × 1GB hugepages
     void *base_ptr = mmap(nullptr, total,

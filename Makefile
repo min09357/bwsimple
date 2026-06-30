@@ -1,5 +1,26 @@
 CXX      = g++
-CXXFLAGS = -O3 -march=native -mavx512f -std=c++20 -Wall -Wextra -pthread
+
+# Base flags. -march=native auto-enables whatever ISA the build host has
+# (AVX-512 if present, else AVX2, etc). Do NOT force -mavx512f so the binary
+# runs on hosts without AVX-512; bw_width.h auto-detects the right width.
+CXXFLAGS = -O3 -march=native -std=c++20 -Wall -Wextra -pthread
+
+# Optional: force the SIMD load width regardless of -march=native detection.
+# Useful for cross-compiles / simulators / other target machines.
+#   make WIDTH=512   ->  -DBW_SIMD_WIDTH=512   (also needs -mavx512f, see below)
+#   make WIDTH=256   ->  -DBW_SIMD_WIDTH=256
+#   make WIDTH=64    ->  -DBW_SIMD_WIDTH=64    (scalar; no SIMD ISA required)
+# If WIDTH is unset, bw_width.h auto-detects from the build target's ISA.
+#
+# NOTE: forcing a width wider than -march=native provides requires also adding
+# the matching arch flag via EXTRA_CXXFLAGS, e.g.:
+#   make WIDTH=512 EXTRA_CXXFLAGS=-mavx512f
+ifdef WIDTH
+CXXFLAGS += -DBW_SIMD_WIDTH=$(WIDTH)
+endif
+
+# Escape hatch for extra arch/codegen flags (e.g. -mavx512f when forcing 512).
+CXXFLAGS += $(EXTRA_CXXFLAGS)
 
 TARGETS = randread_bw stream_bw
 
@@ -7,10 +28,10 @@ TARGETS = randread_bw stream_bw
 
 all: $(TARGETS)
 
-randread_bw: randread_bw.cpp
+randread_bw: randread_bw.cpp bw_width.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
-stream_bw: stream_bw.cpp
+stream_bw: stream_bw.cpp bw_width.h
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 clean:
