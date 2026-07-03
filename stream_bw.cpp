@@ -5,7 +5,7 @@
 // Companion to randread_bw.cpp — same harness, sequential vs random access pattern.
 //
 // Usage: ./stream_bw [ncores] [iters_per_thread] [hugepages_1gb]
-//        e.g.: ./stream_bw 16 100000000 4   (default: ncores=16, iters=100000000, hugepages=4)
+//        e.g.: ./stream_bw 16 100000000 2   (default: ncores=16, iters=100000000, hugepages=2)
 
 #include <algorithm>
 #include <barrier>
@@ -121,7 +121,7 @@ int main(int argc, char *argv[]) {
 
     int     ncores           = (argc > 1) ? std::atoi(argv[1]) : 16;
     int64_t iters_per_thread = (argc > 2) ? std::atoll(argv[2]) : 100'000'000LL;
-    int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 4;
+    int     hugepages_1gb    = (argc > 3) ? std::atoi(argv[3]) : 2;
 
     if (ncores < 1) {
         std::fprintf(stderr, "error: ncores must be >= 1\n");
