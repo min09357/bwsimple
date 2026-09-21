@@ -3,3 +3,4 @@ stream_bw
 .claude/
 config.py
 __pycache__/
+CLAUDE.md
